@@ -19,7 +19,6 @@ from __future__ import print_function
 import os
 import sys
 import copy
-import cv2
 import time
 from tqdm import tqdm
 
@@ -38,7 +37,7 @@ from ppdet.optimizer import ModelEMA
 
 from ppdet.core.workspace import create
 from ppdet.utils.checkpoint import load_weight, load_pretrain_weight
-from ppdet.utils.visualizer import visualize_results, save_result,draw_bbox
+from ppdet.utils.visualizer import visualize_results, save_result
 from ppdet.metrics import Metric, COCOMetric, VOCMetric, WiderFaceMetric, get_infer_results, KeyPointTopDownCOCOEval, KeyPointTopDownMPIIEval, Pose3DEval
 from ppdet.metrics import RBoxMetric, JDEDetMetric, SNIPERCOCOMetric
 from ppdet.data.source.sniper_coco import SniperCOCODataSet
@@ -54,94 +53,18 @@ from .export_utils import _dump_infer_config, _prune_input_spec, apply_to_static
 from paddle.distributed.fleet.utils.hybrid_parallel_util import fused_allreduce_gradients
 
 from ppdet.utils.logger import setup_logger
-import pyrealsense2 as rs
-
 logger = setup_logger('ppdet.engine')
 
 __all__ = ['Trainer']
 
 MOT_ARCH = ['JDE', 'FairMOT', 'DeepSORT', 'ByteTrack', 'CenterTrack']
 
-def decode_image(im_file, im_info):
-    """read rgb image
-    Args:
-        im_file (str|np.ndarray): input can be image path or np.ndarray
-        im_info (dict): info of image
-    Returns:
-        im (np.ndarray):  processed image (np.ndarray)
-        im_info (dict): info of processed image
-    """
-    if isinstance(im_file, str):
-        with open(im_file, 'rb') as f:
-            im_read = f.read()
-        data = np.frombuffer(im_read, dtype='uint8')
-        im = cv2.imdecode(data, 1)  # BGR mode, but need RGB mode
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    else:
-        im = im_file
-    im_info['im_shape'] = np.array(im.shape[:2], dtype=np.float32)
-    im_info['scale_factor'] = np.array([0.93979442, 62500000], dtype=np.float32)
-    return im, im_info
-
-def preprocess(im, preprocess_ops):
-    # process image by preprocess_ops
-    im_info = {
-        'scale_factor': np.array(
-            [0.93979442, 62500000], dtype=np.float32),
-        'im_shape': None,
-    }
-    im, im_info = decode_image(im, im_info)
-    for operator in preprocess_ops:
-        im, im_info = operator(im, im_info)
-    return im, im_info
-class NormalizeImage(object):
-    """normalize image
-    Args:
-        mean (list): im - mean
-        std (list): im / std
-        is_scale (bool): whether need im / 255
-        norm_type (str): type in ['mean_std', 'none']
-    """
-
-    def __init__(self, mean, std, is_scale=True, norm_type='mean_std'):
-        self.mean = mean
-        self.std = std
-        self.is_scale = is_scale
-        self.norm_type = norm_type
-
-    def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
-        """
-        im = im.astype(np.float32, copy=False)
-        if self.is_scale:
-            scale = 1.0 / 255.0
-            im *= scale
-
-        if self.norm_type == 'mean_std':
-            mean = np.array(self.mean)[np.newaxis, np.newaxis, :]
-            std = np.array(self.std)[np.newaxis, np.newaxis, :]
-            im -= mean
-            im /= std
-        return im, im_info
 
 class Trainer(object):
     def __init__(self, cfg, mode='train'):
         self.cfg = cfg.copy()
         assert mode.lower() in ['train', 'eval', 'test'], \
                 "mode should be 'train', 'eval' or 'test'"
-
-        self.pre_process_list = {
-            'NormalizeImage': {
-                'mean': [0.0, 0.0, 0.0],
-                'std': [1.0, 1.0, 1.0],
-            }
-        }
         self.mode = mode.lower()
         self.optimizer = None
         self.is_loaded_weights = False
@@ -289,22 +212,6 @@ class Trainer(object):
         # initial default metrics
         self._init_metrics()
         self._reset_metrics()
-
-    def preprocess(self, im_path):
-        preprocess_ops = []
-        print(self.pre_process_list.items())
-        for op_type, new_op_info in self.pre_process_list.items():
-            print(*new_op_info)
-            preprocess_ops.append(eval(op_type)(**new_op_info))
-
-        input_im_lst = []
-        input_im_info_lst = []
-
-        im, im_info = preprocess(im_path, preprocess_ops)
-        input_im_lst.append(im)
-        input_im_info_lst.append(im_info['im_shape'] / im_info['scale_factor'])
-
-        return np.stack(input_im_lst, axis=0), input_im_info_lst
 
     def _init_callbacks(self):
         if self.mode == 'train':
@@ -1009,279 +916,6 @@ class Trainer(object):
 
                     start = end
 
-    def predict_video(self,
-                draw_threshold=0.5,
-                output_dir='output',
-                save_results=False,
-                visualize=True):
-
-        cap = cv2.VideoCapture('det_video.mp4')
-        video_name= 'det_output_video.mp4'
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video = cv2.VideoWriter(video_name, fourcc, 30, (640, 640))
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Run Infer 
-        self.status['mode'] = 'test'
-        self.model.eval()
-        results = []
-        i=0
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            cv2.imwrite(str(i)+'.jpg', frame)
-            images=[str(i)+'.jpg']
-        #============================================
-            self.dataset.set_images(images)
-            loader = create('TestReader')(self.dataset, 0)
-            print("transform:",loader._sample_transforms)
-            print("batch transform:",loader._batch_transforms)
-
-            imid2path = self.dataset.get_imid2path()
-            anno_file = self.dataset.get_anno()
-            clsid2catid, catid2name = get_categories(
-                self.cfg.metric, anno_file=anno_file)
-
-            # Run Infer 
-            self.status['mode'] = 'test'
-            self.model.eval()
-            if self.cfg.get('print_flops', False):
-                flops_loader = create('TestReader')(self.dataset, 0)
-                self._flops(flops_loader)
-            results = []
-            for step_id, data in enumerate(tqdm(loader)):
-                self.status['step_id'] = step_id
-                # forward
-                outs = self.model(data)
-
-                for key in ['im_shape', 'scale_factor', 'im_id']:
-                    if isinstance(data, typing.Sequence):
-                        outs[key] = data[0][key]
-                    else:
-                        outs[key] = data[key]
-                for key, value in outs.items():
-                    if hasattr(value, 'numpy'):
-                        outs[key] = value.numpy()
-                results.append(outs)
-
-            # sniper
-            if type(self.dataset) == SniperCOCODataSet:
-                results = self.dataset.anno_cropper.aggregate_chips_detections(
-                    results)
-            if visualize:
-                for outs in results:
-                    batch_res = get_infer_results(outs, clsid2catid)
-                    bbox_num = outs['bbox_num']
-
-                    start = 0
-                    for i, im_id in enumerate(outs['im_id']):
-                        image_path = imid2path[int(im_id)]
-                        image = Image.open(image_path).convert('RGB')
-                        image = ImageOps.exif_transpose(image)
-                        self.status['original_image'] = np.array(image.copy())
-
-                        end = start + bbox_num[i]
-                        bbox_res = batch_res['bbox'][start:end] \
-                                if 'bbox' in batch_res else None
-                        # image = visualize_results(
-                        #     image, bbox_res, None, None, None,
-                        #     None, int(im_id), catid2name, draw_threshold)
-                        image =draw_bbox(image, int(im_id), catid2name, bbox_res, draw_threshold)
-                        #=====================================================
-                        img_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                        #video.write(img_array)
-                        cv2.imshow("Video", img_array)
-                        if cv2.waitKey(2)==32:
-                            break
-                        start = end
-        cap.release()
-        cv2.destroyAllWindows()
-        return results
-    
-    def predict_video_rs(self,
-                draw_threshold=0.5,
-                output_dir='output',
-                save_results=False,
-                visualize=True):
-
-                # 创建Realsense管道
-        pipeline = rs.pipeline()
-
-        # 创建配置
-        config = rs.config()
-
-        # 启用深度和彩色流
-        config.enable_stream(rs.stream.depth, 640, 640, rs.format.z16, 30)
-        config.enable_stream(rs.stream.color, 640, 640, rs.format.bgr8, 30)
-
-        # 启动管道
-        pipeline.start(config)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Run Infer 
-        self.status['mode'] = 'test'
-        self.model.eval()
-        results = []
-        i=0
-        while True:
-            # 等待一个新的帧
-            frames = pipeline.wait_for_frames()
-
-            # 获取深度和颜色帧
-            color_frame = frames.get_color_frame()
-            # 将颜色帧转换为Numpy数组
-            color_image = np.asanyarray(color_frame.get_data())
-            cv2.imwrite(str(i)+'.jpg', color_image)
-            images=[str(i)+'.jpg']
-        #============================================
-            self.dataset.set_images(images)
-            loader = create('TestReader')(self.dataset, 0)
-            print("transform:",loader._sample_transforms)
-            print("batch transform:",loader._batch_transforms)
-
-            imid2path = self.dataset.get_imid2path()
-            anno_file = self.dataset.get_anno()
-            clsid2catid, catid2name = get_categories(
-                self.cfg.metric, anno_file=anno_file)
-
-            # Run Infer 
-            self.status['mode'] = 'test'
-            self.model.eval()
-            if self.cfg.get('print_flops', False):
-                flops_loader = create('TestReader')(self.dataset, 0)
-                self._flops(flops_loader)
-            results = []
-            for step_id, data in enumerate(tqdm(loader)):
-                self.status['step_id'] = step_id
-                # forward
-                outs = self.model(data)
-
-                for key in ['im_shape', 'scale_factor', 'im_id']:
-                    if isinstance(data, typing.Sequence):
-                        outs[key] = data[0][key]
-                    else:
-                        outs[key] = data[key]
-                for key, value in outs.items():
-                    if hasattr(value, 'numpy'):
-                        outs[key] = value.numpy()
-                results.append(outs)
-
-            # sniper
-            if type(self.dataset) == SniperCOCODataSet:
-                results = self.dataset.anno_cropper.aggregate_chips_detections(
-                    results)
-            if visualize:
-                for outs in results:
-                    batch_res = get_infer_results(outs, clsid2catid)
-                    bbox_num = outs['bbox_num']
-
-                    start = 0
-                    for i, im_id in enumerate(outs['im_id']):
-                        image_path = imid2path[int(im_id)]
-                        image = Image.open(image_path).convert('RGB')
-                        image = ImageOps.exif_transpose(image)
-                        self.status['original_image'] = np.array(image.copy())
-
-                        end = start + bbox_num[i]
-                        bbox_res = batch_res['bbox'][start:end] \
-                                if 'bbox' in batch_res else None
-                        # image = visualize_results(
-                        #     image, bbox_res, None, None, None,
-                        #     None, int(im_id), catid2name, draw_threshold)
-                        image =draw_bbox(image, int(im_id), catid2name, bbox_res, draw_threshold)
-                        #=====================================================
-                        img_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                        cv2.imshow("Video", img_array)
-                        if cv2.waitKey(2)==32:
-                            break
-
-                        #cv2.imshow("Video",image)
-
-                        start = end
-        cap.release()
-        cv2.destroyAllWindows()
-        return results
-    # def predict_video(self,draw_threshold=0.5,output_dir='output',
-    #             save_results=False,
-    #             visualize=True):
-    #     cap = cv2.VideoCapture('output_video1.mp4')
-    #     if not os.path.exists(output_dir):
-    #         os.makedirs(output_dir)
-
-    #     # Run Infer 
-    #     self.status['mode'] = 'test'
-    #     self.model.eval()
-    #     results = []
-    #     while cap.isOpened():
-    #         ret, frame = cap.read()
-    #         if not ret:
-    #             break
-    #         # 将图像转换为size为[1,3,640,640]的tensor
-    #         frame = cv2.resize(frame, (640, 640))
-    #         #im = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    #         # frame = cv2.resize(frame, (640, 640))
-    #         # frame = frame.transpose((2, 0, 1))
-    #         # frame = np.expand_dims(frame, axis=0)
-    #         # frame = paddle.to_tensor(frame)
-    #         img, shape_list = self.preprocess(frame)
-    #         img=img.transpose((0,3,2,1))
-    #         a={}
-    #         a['image']=paddle.to_tensor(img)
-    #         a['scale_factor']=paddle.to_tensor([[0.93979442, 0.62500000]])
-    #         outs = self.model(a)
-
-    #         for key in ['im_shape', 'scale_factor', 'im_id']:
-    #             if isinstance(data, typing.Sequence):
-    #                 outs[key] = data[0][key]
-    #             else:
-    #                 outs[key] = data[key]
-    #         for key, value in outs.items():
-    #             if hasattr(value, 'numpy'):
-    #                 outs[key] = value.numpy()
-    #         results.append(outs)
-
-    #     if visualize:
-    #         for outs in results:
-    #             batch_res = get_infer_results(outs, clsid2catid)
-    #             bbox_num = outs['bbox_num']
-
-    #             start = 0
-    #             for i, im_id in enumerate(outs['im_id']):
-    #                 image_path = imid2path[int(im_id)]
-    #                 image = Image.open(image_path).convert('RGB')
-    #                 image = ImageOps.exif_transpose(image)
-    #                 self.status['original_image'] = np.array(image.copy())
-
-    #                 end = start + bbox_num[i]
-    #                 bbox_res = batch_res['bbox'][start:end] \
-    #                         if 'bbox' in batch_res else None
-    #                 mask_res = batch_res['mask'][start:end] \
-    #                         if 'mask' in batch_res else None
-    #                 segm_res = batch_res['segm'][start:end] \
-    #                         if 'segm' in batch_res else None
-    #                 keypoint_res = batch_res['keypoint'][start:end] \
-    #                         if 'keypoint' in batch_res else None
-    #                 pose3d_res = batch_res['pose3d'][start:end] \
-    #                         if 'pose3d' in batch_res else None
-    #                 image = visualize_results(
-    #                     image, bbox_res, mask_res, segm_res, keypoint_res,
-    #                     pose3d_res, int(im_id), catid2name, draw_threshold)
-    #                 self.status['result_image'] = np.array(image.copy())
-    #                 if self._compose_callback:
-    #                     self._compose_callback.on_step_end(self.status)
-    #                 # save image with detection
-    #                 save_name = self._get_save_image_name(output_dir,
-    #                                                       image_path)
-    #                 logger.info("Detection bbox results save in {}".format(
-    #                     save_name))
-    #                 image.save(save_name, quality=95)
-
-    #                 start = end
-    #     return results
-
     def predict(self,
                 images,
                 draw_threshold=0.5,
@@ -1293,8 +927,6 @@ class Trainer(object):
 
         self.dataset.set_images(images)
         loader = create('TestReader')(self.dataset, 0)
-        print("transform:",loader._sample_transforms)
-        print("batch transform:",loader._batch_transforms)
 
         imid2path = self.dataset.get_imid2path()
 
@@ -1350,10 +982,7 @@ class Trainer(object):
         for step_id, data in enumerate(tqdm(loader)):
             self.status['step_id'] = step_id
             # forward
-            a={}
-            a['image']=data['image']
-            a['scale_factor']=paddle.to_tensor([[0.93979442, 0.62500000]])
-            outs = self.model(a)
+            outs = self.model(data)
 
             for _m in metrics:
                 _m.update(data, outs)
@@ -1415,8 +1044,6 @@ class Trainer(object):
 
                     start = end
         return results
-
-
 
     def _get_save_image_name(self, output_dir, image_path):
         """
